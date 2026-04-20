@@ -1,0 +1,9 @@
+jupyterlab
+azure-identity
+openai
+pydantic
+azure-ai-inference
+python-dotenv
+azure-mgmt-cognitiveservices
+pandas
+azure-search-documents
