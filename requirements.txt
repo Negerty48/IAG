@@ -13,3 +13,4 @@ scikit-learn
 matplotlib
 numpy
 seaborn
+flask
