@@ -7,3 +7,9 @@ python-dotenv
 azure-mgmt-cognitiveservices
 pandas
 azure-search-documents
+kagglehub[pandas-datasets]
+tensorflow
+scikit-learn
+matplotlib
+numpy
+seaborn
