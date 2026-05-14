@@ -14,3 +14,5 @@ matplotlib
 numpy
 seaborn
 flask
+streamlit
+opencv-python
