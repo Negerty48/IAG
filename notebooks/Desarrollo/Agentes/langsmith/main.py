@@ -5,59 +5,118 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from agent import builder
 from langgraph.checkpoint.memory import MemorySaver
+from langchain_core.messages import ToolMessage
 
 load_dotenv()
 
-# Instanciamos el guardado de memoria. Esto es lo que permite que el bot recuerde la conversación de cada usuario de forma independiente.
 memoria_telegram = MemorySaver()
 
-# Compilamos el 'builder' de agent.py inyectandole explícitamente la memoria.
-agente_telegram = builder.compile(checkpointer=memoria_telegram)
+agente_telegram = builder.compile(
+    checkpointer=memoria_telegram,
+    interrupt_before=["subflujo_stats"]
+)
 
-# FUNCIONES AUXILIARES
 def formatear(texto: str) -> str:
-    """
-    Adapta el texto generado por el LLM (Markdown) al formato que acepta Telegram (HTML).
-    """
     texto = re.sub(r'#+\s*', '', texto)
     texto = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', texto)
     return texto
 
-# LÓGICA PRINCIPAL DEL BOT (HANDLER)
 async def procesar_mensaje(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Esta función se ejecuta cada vez que el bot recibe un mensaje de texto.
-    """
-    # Extraemos los datos útiles del mensaje entrante
     chat_id = update.message.chat_id
     user_text = update.message.text
     nombre_usuario = update.message.chat.first_name
 
-    # Muestra el estado "Escribiendo..." en la app de Telegram del usuario
     await context.bot.send_chat_action(chat_id=chat_id, action='typing')
 
     try:
-        # Configuramos el hilo usando el chat_id como identificador único.        
         config = {"configurable": {"thread_id": str(chat_id)}}
+        estado = await agente_telegram.aget_state(config)
         
-        # Estructuramos el mensaje del usuario en el formato que espera nuestro StateGraph
-        inputs = {"messages": [("user", user_text)]}
+        # 2. EVALUAMOS SI ESTABA PAUSADO ANTES DE ENTRAR A LAS ESTADÍSTICAS
+        if estado.next and "subflujo_stats" in estado.next:
+            # CASO A: SI EL USUARIO APRUEBA
+            if user_text.lower() in ["sí", "si", "dale", "ok", "yes", "autorizo"]:
+                await update.message.reply_text("⏳ Autorizado. Onyx está extrayendo los datos de StatsBomb...")
+                resultado = await agente_telegram.ainvoke(None, config=config)
+                
+            # CASO B: SI EL USUARIO DENIEGA
+            else:
+                await update.message.reply_text("❌ Operación cancelada. El agente no buscará estadísticas.")
+                
+                # Falsificamos la salida del subgrafo paralelo para que Onyx sepa que se canceló
+                await agente_telegram.aupdate_state(
+                    config, 
+                    {"contexto_paralelo": ["Operación cancelada explícitamente por el analista."]},
+                    as_node="subflujo_stats"
+                )
+                
+                # Reanudamos el agente para que procese la cancelación en silencio
+                resultado = await agente_telegram.ainvoke(None, config=config)
+                return
+            
+        # 3. FLUJO NORMAL (Si no estaba pausado)
+        else:
+            inputs = {"messages": [("user", user_text)]}
+            resultado = await agente_telegram.ainvoke(inputs, config=config)
 
-        # Llamamos al agente pasándole el input y la configuración de memoria
-        resultado = await agente_telegram.ainvoke(inputs, config=config)
+        # 4. VERIFICAMOS SI SE HA PAUSADO TRAS LA ÚLTIMA ACCIÓN
+        nuevo_estado = await agente_telegram.aget_state(config)
+        if nuevo_estado.next and "subflujo_stats" in nuevo_estado.next:
+            
+            # Leemos la memoria interna de Onyx para saber qué va a buscar
+            match = nuevo_estado.values.get("match_id", "Desconocido")
+            jugador = nuevo_estado.values.get("jugador_objetivo")
+            
+            peticion = f"Partido ID: {match}"
+            if jugador:
+                peticion += f" | Jugador: {jugador}"
+            
+            mensaje_hitl = (
+                f"⚠️ <b>Control Manual Requerido:</b>\n"
+                f"El agente va a ejecutar consultas masivas para:\n<code>{peticion}</code>\n"
+                f"¿Autorizas la ejecución? (sí / no)"
+            )
+            await update.message.reply_text(mensaje_hitl, parse_mode='HTML')
+            return
+
+        # 5. RESPUESTA FINAL CON MANEJO DE LÍMITES DE TELEGRAM
         respuesta_agente = resultado["messages"][-1].content
-
-        # Limpiamos el texto y lo enviamos de vuelta al chat de Telegram indicando que use parseo HTML
+        
+        if not respuesta_agente:
+            respuesta_agente = "Operación procesada, pero no hay respuesta de texto."
+            
         texto_limpio = formatear(respuesta_agente)
-        await update.message.reply_text(texto_limpio, parse_mode='HTML')
+        
+        # División por límite de 4000 caracteres
+        LIMITE_TELEGRAM = 4000
+        if len(texto_limpio) > LIMITE_TELEGRAM:
+            parrafos = texto_limpio.split('\n\n')
+            mensaje_actual = ""
+            for parrafo in parrafos:
+                if len(parrafo) > LIMITE_TELEGRAM:
+                    parrafo = parrafo[:LIMITE_TELEGRAM - 100] + "... [Continúa]"
+                if len(mensaje_actual) + len(parrafo) < LIMITE_TELEGRAM:
+                    mensaje_actual += parrafo + "\n\n"
+                else:
+                    try:
+                        await update.message.reply_text(mensaje_actual, parse_mode='HTML')
+                    except Exception:
+                        await update.message.reply_text(mensaje_actual)
+                    mensaje_actual = parrafo + "\n\n"
+            if mensaje_actual.strip():
+                try:
+                    await update.message.reply_text(mensaje_actual, parse_mode='HTML')
+                except Exception:
+                    await update.message.reply_text(mensaje_actual)
+        else:
+            await update.message.reply_text(texto_limpio, parse_mode='HTML')
+            
         print(f"✅ Respuesta enviada a {nombre_usuario}")
         
     except Exception as e:
-        # Capturador de errores por si falla la API de OpenAI, LangGraph o la de StatsBomb
-        print(f"❌ Error: {e}")
-        await update.message.reply_text("Ups, fallo técnico en el análisis. ¿Me lo repites?")
+        print(f"❌ Error crítico: {e}")
+        await update.message.reply_text("Ups, fallo técnico en la infraestructura de Onyx. ¿Me lo repites?")
 
-# INICIALIZACIÓN DEL SERVIDOR DE TELEGRAM
 if __name__ == '__main__':
     token = os.getenv("TELEGRAM_TOKEN")
     if not token:
@@ -65,9 +124,7 @@ if __name__ == '__main__':
         exit(1)
 
     app = Application.builder().token(token).build()
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, procesar_mensaje))
     
-    print("🤖 ScoutAgent (LangGraph) en producción escuchando a Telegram...")
-
+    print("🤖 ScoutAgent (Fan-Out Estructural) en producción escuchando a Telegram...")
     app.run_polling()

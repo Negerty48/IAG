@@ -12,6 +12,11 @@ langchain-tavily
 wikipedia
 trustcall
 langgraph-cli[inmem]
+langchain-openai
+langchain-core
+langgraph
+python-telegram-bot
+azure-identity
 
 aiohttp>=3.13.4
 Pygments>=2.20.0
