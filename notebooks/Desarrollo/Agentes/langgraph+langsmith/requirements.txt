@@ -1,0 +1,6 @@
+langchain-openai
+langgraph
+python-dotenv
+pyautogui
+screen-brightness-control
+pycaw
