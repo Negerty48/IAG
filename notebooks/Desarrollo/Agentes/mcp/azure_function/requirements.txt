@@ -1,0 +1,5 @@
+azure-functions
+mcp
+fastapi
+uvicorn
+anyio

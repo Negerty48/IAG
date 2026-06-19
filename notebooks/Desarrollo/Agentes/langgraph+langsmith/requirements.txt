@@ -4,3 +4,6 @@ python-dotenv
 pyautogui
 screen-brightness-control
 pycaw
+SpeechRecognition
+pyaudio
+pyttsx3

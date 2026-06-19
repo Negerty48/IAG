@@ -1,15 +1,16 @@
 import os
 import operator
 import subprocess
+import threading
 from typing import Annotated, Optional
-from typing_extensions import TypedDict
+from typing_extensions import Literal, TypedDict
 import pyautogui
 import screen_brightness_control as sbc
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 from langchain_openai import AzureChatOpenAI
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
@@ -19,11 +20,63 @@ from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 import comtypes
 import difflib
 
-# Cargar variables de entorno (.env)
+import pyttsx3
+import speech_recognition as sr
+
+# Variables de entorno, motor de voz y reconocimiento de voz
 load_dotenv()
 
+def _ejecutar_voz(texto: str):
+    """Función de bajo nivel que se ejecuta en una burbuja aislada (Hilo)."""
+    
+    comtypes.CoInitialize()
+    
+    try:
+        motor_aislado = pyttsx3.init()
+        motor_aislado.setProperty('rate', 175)
+        motor_aislado.say(texto)
+        motor_aislado.runAndWait()
+    finally:        
+        comtypes.CoUninitialize()
+
+recognizer = sr.Recognizer()
+
 # ==========================================
-# 1. ESTADO GLOBAL DE ONYX
+# FUNUCIONES AUXILIARES DE VOZ
+# ==========================================
+
+def hablar(texto: str):
+    """Lanzador principal a prueba de bloqueos asíncronos."""
+    print(f"\n🗣️ Onyx: {texto}")
+    
+    # Creamos un hilo de usar y tirar solo para hablar
+    hilo_voz = threading.Thread(target=_ejecutar_voz, args=(texto,))
+    hilo_voz.start()
+    hilo_voz.join() # El programa espera aquí pacientemente hasta que Onyx termine la frase
+
+def escuchar() -> str:
+    """Abre el micrófono y traduce la voz del usuario a texto"""    
+
+    with sr.Microphone() as source:
+        print("\n🎤 [Onyx te está escuchando...]")
+        # Ajusta el ruido de fondo rápido para mayor precisión
+        recognizer.adjust_for_ambient_noise(source, duration=0.5)
+        try:
+            audio = recognizer.listen(source, timeout=5, phrase_time_limit=10)
+            texto = recognizer.recognize_google(audio, language="es-ES")
+            print(f"👤 Analista: {texto}")
+            return texto
+        except sr.WaitTimeoutError:
+            return ""
+        except sr.UnknownValueError:
+            print("⚠️ (No he entendido lo que has dicho)")
+            return ""
+        except sr.RequestError:
+            print("❌ Error con el servicio de reconocimiento de voz.")
+            return ""
+
+# ==========================================
+# ESTADO GLOBAL DE ONYX
 # ==========================================
 class OnyxState(TypedDict):
     messages: list
@@ -37,11 +90,11 @@ class OnyxState(TypedDict):
     contexto_paralelo: Annotated[list, operator.add]
 
 # ==========================================
-# 2. MODELO DE EXTRACCIÓN UNIFICADO (Pydantic)
+# MODELO DE EXTRACCIÓN UNIFICADO (Pydantic)
 # ==========================================
 class ClasificadorOnyx(BaseModel):
-    intencion: str = Field(
-        description="Clasifica la intención del usuario. Opciones: 'relax' (fatiga/descanso), 'buscar' (encontrar archivos/juegos), 'ejecutar' (abrir/lanzar una opción numérica), 'charla' (conversación normal)."
+    intencion: Literal["ajustes", "buscar", "ejecutar", "charla"] = Field(
+        description="Clasifica la orden. Usa 'ajustes' EXCLUSIVAMENTE para modificar hardware (cambiar brillo, atenuar pantalla, subir/bajar volumen). Usa 'buscar' para encontrar cosas. Usa 'ejecutar' para abrir números/archivos. Usa 'charla' para conversar."
     )
     brillo: Optional[int] = Field(description="Nivel de brillo si se menciona (0-100).", default=None)
     volumen: Optional[int] = Field(description="Nivel de volumen si se menciona (0-100).", default=None)
@@ -53,7 +106,7 @@ class ClasificadorOnyx(BaseModel):
     abrir_con_vscode: bool = Field(description="True si el usuario pide explícitamente abrir con VS Code o Visual Studio Code.", default=False)
 
 # ==========================================
-# 3. LLM CONFIGURACIÓN
+# LLM CONFIGURACIÓN
 # ==========================================
 llm = AzureChatOpenAI(
     azure_deployment="gpt-4o-mini",
@@ -64,7 +117,7 @@ llm = AzureChatOpenAI(
 )
 
 # ==========================================
-# 4. NODOS DEL GRAFO
+# NODOS DEL GRAFO
 # ==========================================
 
 def nodo_clasificador(state: OnyxState):
@@ -133,18 +186,21 @@ def nodo_bajar_brillo(state: OnyxState):
         return {"contexto_paralelo": [f"❌ Error en hardware de brillo: {e}"]}
 
 
-def nodo_sintesis_relax(state: OnyxState):
-    # Filtramos los mensajes para omitir los "sin cambios" y dejar un reporte limpísimo
+def nodo_sintesis_ajustes(state: OnyxState):
     bloques = state.get("contexto_paralelo", [])
     cambios_reales = [b for b in bloques if "sin cambios" not in b]
     
-    if cambios_reales:
-        detalles = ", ".join(cambios_reales)
-        msg = f"Onyx: Entorno relax configurado con éxito. ({detalles})"
-    else:
-        msg = "Onyx: No se han realizado modificaciones en el entorno."
-        
-    return {"messages": [AIMessage(content=msg)], "contexto_paralelo": []}
+    info = ", ".join(cambios_reales) if cambios_reales else "Ningún ajuste"
+    ultimo_mensaje = state["messages"][-1]
+    
+    instruccion = SystemMessage(content=(
+        f"Eres Onyx, el asistente del sistema. Acabas de ejecutar estas acciones: {info}. "
+        "Confírmale al usuario de forma hablada, extremadamente natural, empática y breve (1 frase) que ya lo has hecho. "
+        "No parezcas un robot."
+    ))
+    
+    respuesta = llm.invoke([instruccion, ultimo_mensaje])
+    return {"messages": [respuesta], "contexto_paralelo": []}
 
 # --- Subgrafo Map-Reduce (Búsqueda) ---
 def nodo_buscar_archivos(state: dict):
@@ -194,24 +250,36 @@ def nodo_sintesis_busqueda(state: OnyxState):
     bloques_contexto = state.get("contexto_paralelo", [])
     rutas_limpias = []
     
-    # Parseamos las rutas reales ocultas en tus bloques de texto
     for bloque in bloques_contexto:
         for linea in bloque.split("\n"):
             if linea.startswith("PATH:"):
                 rutas_limpias.append(linea.replace("PATH:", ""))
                 
+    ultimo_mensaje = state["messages"][-1]
+                
     if not rutas_limpias:
-        msg = f"Onyx: No he encontrado nada relacionado con '{state.get('termino_busqueda')}' en tus directorios."
-        return {"messages": [AIMessage(content=msg)], "contexto_paralelo": []}
+        instruccion = SystemMessage(content=f"Eres Onyx. Dile al usuario de forma natural y hablada que no has encontrado '{state.get('termino_busqueda')}'. Sé breve.")
+        respuesta = llm.invoke([instruccion, ultimo_mensaje])
+        return {"messages": [respuesta], "contexto_paralelo": []}
         
-    texto_out = "Onyx: He peinado tus carpetas en paralelo. Aquí tienes las opciones sobre la mesa:\n"
+    # 1. SALIDA VISUAL: Imprimimos la lista en la terminal al instante
+    print("\n" + "="*60)
+    print("📁 LISTA DE ARCHIVOS ENCONTRADOS EN EL SISTEMA:")
     for idx, ruta in enumerate(rutas_limpias, 1):
-        texto_out += f"\n[{idx}] 📁 {os.path.basename(ruta)}\n   └─ Ruta: {ruta}"
-    texto_out += "\n\nDime el número que quieres que ejecute (ej: 'ejecuta el 1' o 'abre el 2 en vscode')"
+        print(f"[{idx}] {os.path.basename(ruta)}")
+        print(f"    └─ {ruta}")
+    print("="*60 + "\n")
+    
+    # 2. SALIDA DE VOZ (NLG): Le decimos al LLM que sea conversacional
+    instruccion = SystemMessage(content=(
+        "Eres Onyx. Acabas de imprimir una lista visual de archivos en la pantalla del usuario. "
+        "NO LEAS LA LISTA. Dile de forma natural y hablada algo como: 'Ya los tienes en pantalla, ¿cuál quieres ver?' o 'He encontrado esto, ¿cuál abro?'."
+    ))
+    respuesta = llm.invoke([instruccion, ultimo_mensaje])
     
     return {
-        "messages": [AIMessage(content=texto_out)],
-        "juegos_encontrados": rutas_limpias, # Persiste la lista indexada en el estado
+        "messages": [respuesta],
+        "juegos_encontrados": rutas_limpias,
         "contexto_paralelo": []
     }
 
@@ -220,58 +288,92 @@ def nodo_ejecutar_archivo(state: OnyxState):
     idx = state.get("indice_ejecutar")
     lista_juegos = state.get("juegos_encontrados", [])
     modo = state.get("modo_apertura", "normal")
+    ultimo_mensaje = state["messages"][-1]
     
-    if not lista_juegos:
-        return {"messages": [AIMessage(content="Onyx: No tengo ninguna lista de archivos en caché. Primero pídeme buscar algo.")]}
-        
-    if idx is None or idx < 1 or idx > len(lista_juegos):
-        return {"messages": [AIMessage(content=f"Onyx: El índice {idx} no corresponde a ninguna opción válida (1-{len(lista_juegos)}).")]}
+    if not lista_juegos or idx is None or idx < 1 or idx > len(lista_juegos):
+        instruccion = SystemMessage(content="Eres Onyx. Dile al usuario de forma natural que el número que ha elegido no está en la lista o que necesitas que busque algo primero.")
+        return {"messages": [llm.invoke([instruccion, ultimo_mensaje])]}
         
     ruta_real = lista_juegos[idx - 1]
     
     try:
         if modo == "vscode":
-            # Ejecuta 'code <ruta>' de forma asíncrona mediante la terminal de Windows
+            import subprocess
             subprocess.Popen(['code', ruta_real], shell=True)
-            msg = f"💻 Abriendo ruta en Visual Studio Code:\n`{ruta_real}`"
+            accion = "Abierto en Visual Studio Code"
         else:
             if os.path.exists(ruta_real):
-                os.startfile(ruta_real) # os.startfile abre carpetas en explorador y arranca ejecutables
-                if os.path.isdir(ruta_real):
-                    msg = f"📁 Explorador de archivos abierto en:\n`{ruta_real}`"
-                else:
-                    msg = f"🚀 Ejecutando aplicación:\n`{ruta_real}`"
+                os.startfile(ruta_real)
+                accion = "Ejecutado de forma nativa"
             else:
-                msg = f"❌ Vaya, parece que la ruta ya no existe en el disco: `{ruta_real}`"
+                accion = "Error: La ruta ya no existe"
     except Exception as e:
-        msg = f"❌ Error de Windows al procesar la acción: {e}"
+        accion = f"Error del sistema operativo: {e}"
         
-    return {"messages": [AIMessage(content=msg)]}
+    # Invocación final a NLG
+    instruccion = SystemMessage(content=(
+        f"Eres Onyx. Acabas de hacer esto en el PC: '{accion}' con el archivo '{os.path.basename(ruta_real)}'. "
+        "Informa al usuario de forma natural y hablada (1 frase breve). NO leas la ruta completa del disco duro."
+    ))
+    respuesta = llm.invoke([instruccion, ultimo_mensaje])
+    
+    return {"messages": [respuesta]}
 
 def nodo_charla(state: OnyxState):
     res = llm.invoke(state["messages"])
     return {"messages": [res]}
 
 def nodo_preguntar_parametros(state: OnyxState):
-    return {"messages": [AIMessage(content="Onyx: De acuerdo, vamos a atenuar el entorno. ¿A qué nivel configuro el brillo y el volumen?")]}
+    # Cogemos el último mensaje del usuario para que el LLM tenga el contexto
+    ultimo_mensaje = state["messages"][-1]
+    
+    # Le damos la instrucción por sistema
+    instruccion = SystemMessage(content=(
+        "Eres Onyx, el asistente del sistema operativo. "
+        "El usuario te ha pedido cambiar ajustes del entorno (brillo o volumen), "
+        "pero se le ha olvidado decirte a qué nivel o porcentaje (0-100). "
+        "Pregúntale de forma natural, muy breve y conversacional qué niveles desea."
+    ))
+    
+    # Invocamos al LLM pasándole la instrucción y lo que dijo el usuario
+    respuesta_dinamica = llm.invoke([instruccion, ultimo_mensaje])
+    
+    return {"messages": [respuesta_dinamica]}
 
 def nodo_preguntar_termino(state: OnyxState):
-    return {"messages": [AIMessage(content="Onyx: Por supuesto. ¿Qué juego, carpeta o archivo quieres que busque en el equipo?")]}
+    ultimo_mensaje = state["messages"][-1]
+    
+    instruccion = SystemMessage(content=(
+        "Eres Onyx, el asistente del sistema. "
+        "El usuario quiere que busques un archivo, juego o programa en el equipo, "
+        "pero no te ha dicho el nombre. "
+        "Pregúntale de forma natural y muy directa qué es exactamente lo que quiere buscar."
+    ))
+    
+    respuesta_dinamica = llm.invoke([instruccion, ultimo_mensaje])
+    
+    return {"messages": [respuesta_dinamica]}
 
 # ==========================================
 # 5. ENRUTADORES CONDICIONALES
 # ==========================================
 def enrutador_maestro(state: OnyxState):
-    intencion = state.get("intencion")
-    if intencion == "relax": return "evaluar_relax"
-    elif intencion == "buscar": return "evaluar_busqueda"
-    elif intencion == "ejecutar": return "ejecutor"
+    intencion_cruda = state.get("intencion")
+    intencion = intencion_cruda.lower().strip()
+    
+    if intencion == "ajustes": 
+        return "evaluar_ajustes"
+    elif intencion == "buscar": 
+        return "evaluar_busqueda"
+    elif intencion == "ejecutar": 
+        return "ejecutor"
+        
     return "charla"
 
-def enrutador_relax(state: OnyxState):
+def enrutador_ajustes(state: OnyxState):
     if state.get("nivel_brillo") is None and state.get("nivel_volumen") is None:
         return "nodo_preguntar_parametros"
-    return ["relax_volumen", "relax_brillo"] # Ejecución en Paralelo Estático
+    return ["ajustes_volumen", "ajustes_brillo"]
 
 def enrutador_busqueda(state: OnyxState):
     if not state.get("termino_busqueda"):
@@ -282,7 +384,7 @@ def enrutador_busqueda(state: OnyxState):
     return [Send("buscar_worker", {"directorio_base": d, "termino_busqueda": state["termino_busqueda"]}) for d in directorios]
 
 # ==========================================
-# 6. CONSTRUCCIÓN Y COMPILACIÓN DEL GRAFO
+# CONSTRUCCIÓN Y COMPILACIÓN DEL GRAFO
 # ==========================================
 builder = StateGraph(OnyxState)
 
@@ -293,10 +395,10 @@ builder.add_node("ejecutor", nodo_ejecutar_archivo)
 builder.add_node("nodo_preguntar_parametros", nodo_preguntar_parametros)
 builder.add_node("nodo_preguntar_termino", nodo_preguntar_termino)
 
-# Nodos subflujo Relax
-builder.add_node("relax_volumen", nodo_bajar_volumen)
-builder.add_node("relax_brillo", nodo_bajar_brillo)
-builder.add_node("relax_sintesis", nodo_sintesis_relax)
+# Nodos subflujo Ajustes
+builder.add_node("ajustes_volumen", nodo_bajar_volumen)
+builder.add_node("ajustes_brillo", nodo_bajar_brillo)
+builder.add_node("ajustes_sintesis", nodo_sintesis_ajustes)
 
 # Nodos subflujo Map-Reduce
 builder.add_node("buscar_worker", nodo_buscar_archivos)
@@ -305,17 +407,17 @@ builder.add_node("buscar_sintesis", nodo_sintesis_busqueda)
 # Flujo de Bordes y Enrutamientos
 builder.add_edge(START, "clasificador")
 builder.add_conditional_edges("clasificador", enrutador_maestro, {
-    "evaluar_relax": "evaluar_relax_sub",
+    "evaluar_ajustes": "evaluar_ajustes_sub",
     "evaluar_busqueda": "evaluar_busqueda_sub",
     "ejecutor": "ejecutor",
     "charla": "charla"
 })
 
-# Orquestación virtual para ramificar Relax
-builder.add_node("evaluar_relax_sub", lambda s: s)
-builder.add_conditional_edges("evaluar_relax_sub", enrutador_relax, ["nodo_preguntar_parametros", "relax_volumen", "relax_brillo"])
-builder.add_edge(["relax_volumen", "relax_brillo"], "relax_sintesis")
-builder.add_edge("relax_sintesis", END)
+# Orquestación virtual para ramificar Ajustes
+builder.add_node("evaluar_ajustes_sub", lambda s: s)
+builder.add_conditional_edges("evaluar_ajustes_sub", enrutador_ajustes, ["nodo_preguntar_parametros", "ajustes_volumen", "ajustes_brillo"])
+builder.add_edge(["ajustes_volumen", "ajustes_brillo"], "ajustes_sintesis")
+builder.add_edge("ajustes_sintesis", END)
 builder.add_edge("nodo_preguntar_parametros", END)
 
 # Orquestación virtual para Map-Reduce
@@ -332,40 +434,43 @@ builder.add_edge("charla", END)
 agente_onyx = builder.compile()
 
 # ==========================================
-# 7. BUCLE INTERACTIVO DE CONSOLA
+# BUCLE INTERACTIVO (STT + TTS)
 # ==========================================
 if __name__ == "__main__":
-    print("🖥️  Onyx OS Engine activo. Escribe 'salir' para finalizar.")
+    print("\n" + "*"*50)
+    print("🖥️  Onyx OS Engine activo con Voice Interface")
+    print("*"*50)
     
-    # Mantenemos las variables persistentes (como la caché de juegos) vivas en la sesión de consola
     estado_sesion = {
         "messages": [],
         "juegos_encontrados": [],
         "contexto_paralelo": []
     }
     
-    # Exportar el grafo a imagen para tu documentación/TFM si posees pygraphviz
-    try:
-        with open("grafo_arquitectura_onyx.png", "wb") as f:
-            f.write(agente_onyx.get_graph().draw_mermaid_png())
-        print("📊 Grafo de arquitectura exportado como 'grafo_arquitectura_onyx.png'")
-    except:
-        pass
+    hablar("Sistemas en línea. A tu disposición.")
 
     while True:
-        usuario_input = input("\nAnalista: ")
-        if usuario_input.lower() == 'salir':
-            print("Apagando módulos de Onyx...")
+        # 1. Escuchamos por el micrófono
+        usuario_input = escuchar()
+        
+        # Si no detectó voz o hubo un error, repetimos el bucle
+        if not usuario_input:
+            continue
+            
+        # Comando manual de emergencia para salir
+        if "apagar sistema" in usuario_input.lower() or "salir" in usuario_input.lower():
+            hablar("Desconectando módulos. Que tengas un buen día.")
             break
             
         estado_sesion["messages"].append(HumanMessage(content=usuario_input))
         
-        # Ejecución a través del grafo integrado de LangGraph
+        # 2. Ejecución del Grafo
         resultado_grafo = agente_onyx.invoke(estado_sesion)
         
-        # Sincronizamos el estado de la sesión para mantener la memoria multi-turno
         estado_sesion["messages"] = resultado_grafo["messages"]
         if "juegos_encontrados" in resultado_grafo:
             estado_sesion["juegos_encontrados"] = resultado_grafo["juegos_encontrados"]
             
-        print(f"\n{resultado_grafo['messages'][-1].content}")
+        # 3. El LLM Habla (La respuesta final generada por NLG)
+        respuesta_final = resultado_grafo['messages'][-1].content
+        hablar(respuesta_final)
