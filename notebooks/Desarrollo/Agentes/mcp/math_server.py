@@ -38,4 +38,4 @@ def get_system_info() -> str:
 if __name__ == "__main__":
     # If standard execution, run the stdio transport (ideal for command line / subprocess usage)
     # FastMCP defaults to running the server over stdio when called this way.
-    mcp.run()
+    mcp.run(transport="streamable_http")
