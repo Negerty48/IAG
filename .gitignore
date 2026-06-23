@@ -3,3 +3,5 @@ venv/
 .env
 __pycache__/
 .langgraph_api/
+deploy.zip
+*.zip
